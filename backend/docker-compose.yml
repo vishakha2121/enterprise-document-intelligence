@@ -1,0 +1,179 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: docai_postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: docai
+      POSTGRES_INITDB_ARGS: "-E UTF8 --locale=C"
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - docai_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis Cache & Message Broker
+  redis:
+    image: redis:7-alpine
+    container_name: docai_redis
+    command: redis-server --appendonly yes --requirepass redispass
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - docai_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Backend API
+  backend:
+    build: .
+    container_name: docai_backend
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/docai
+      - REDIS_URL=redis://:redispass@redis:6379
+      - CELERY_BROKER_URL=redis://:redispass@redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://:redispass@redis:6379/1
+      - ENVIRONMENT=development
+      - DEBUG=true
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./:/app
+      - uploads_data:/app/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - docai_network
+
+  # Celery Worker
+  celery_worker:
+    build: .
+    container_name: docai_celery_worker
+    command: celery -A app.workers.celery_app worker --loglevel=info --concurrency=4
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/docai
+      - REDIS_URL=redis://:redispass@redis:6379
+      - CELERY_BROKER_URL=redis://:redispass@redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://:redispass@redis:6379/1
+      - ENVIRONMENT=development
+    volumes:
+      - ./:/app
+      - uploads_data:/app/uploads
+    depends_on:
+      - postgres
+      - redis
+      - backend
+    networks:
+      - docai_network
+
+  # Celery Beat (Scheduler)
+  celery_beat:
+    build: .
+    container_name: docai_celery_beat
+    command: celery -A app.workers.celery_app beat --loglevel=info
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/docai
+      - REDIS_URL=redis://:redispass@redis:6379
+      - CELERY_BROKER_URL=redis://:redispass@redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://:redispass@redis:6379/1
+    volumes:
+      - ./:/app
+    depends_on:
+      - postgres
+      - redis
+      - backend
+    networks:
+      - docai_network
+
+  # Flower (Celery Monitoring)
+  flower:
+    image: mher/flower:2.0
+    container_name: docai_flower
+    command: celery --broker=redis://:redispass@redis:6379/0 flower --port=5555
+    ports:
+      - "5555:5555"
+    environment:
+      - CELERY_BROKER_URL=redis://:redispass@redis:6379/0
+    depends_on:
+      - redis
+      - celery_worker
+    networks:
+      - docai_network
+
+  # Nginx (Reverse Proxy for Production - Optional for dev)
+  nginx:
+    image: nginx:alpine
+    container_name: docai_nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf
+      - ./frontend/dist:/usr/share/nginx/html
+    depends_on:
+      - backend
+    networks:
+      - docai_network
+    profiles:
+      - production
+
+  # PgAdmin (Database Management)
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: docai_pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@docai.com
+      PGADMIN_DEFAULT_PASSWORD: admin123
+    ports:
+      - "5050:80"
+    depends_on:
+      - postgres
+    networks:
+      - docai_network
+    profiles:
+      - devtools
+
+  # Redis Commander (Redis Management)
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: docai_redis_commander
+    environment:
+      REDIS_HOSTS: local:redis:6379
+      REDIS_PASSWORD: redispass
+    ports:
+      - "8081:8081"
+    depends_on:
+      - redis
+    networks:
+      - docai_network
+    profiles:
+      - devtools
+
+networks:
+  docai_network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  uploads_data:
